@@ -262,7 +262,8 @@ if(ENSEMBLE_FABRIC_BUILD_TESTS)
     test_adversarial
     test_recovery_epoch
     test_reference_backend
-    test_integration)
+    test_integration
+    test_regression)
   foreach(test ${ENSEMBLE_FABRIC_TESTS})
     add_executable(${test} tests/${test}.cpp)
     target_link_libraries(${test} PRIVATE ensemble_fabric ensemble_fabric_warnings)

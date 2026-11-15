@@ -48,6 +48,9 @@ CandidateEvaluationSummary summarize_candidate(const ExecutionRecord& execution,
   summary.generation = candidate.generation;
   bool first_score = true;
   std::vector<ParticipantId> distinct;
+  // Mandatory evidence is counted per criterion: two verifiers answering the
+  // same criterion are not evidence for a criterion nobody answered.
+  std::vector<CriterionRef> hard_criteria;
   for (const EvaluationRecord& evaluation : execution.evaluations) {
     if (evaluation.candidate != candidate.id || !evaluation.current) {
       continue;
@@ -70,7 +73,11 @@ CandidateEvaluationSummary summarize_candidate(const ExecutionRecord& execution,
       case CategoricalJudgment::unknown: summary.unknowns += 1u; break;
     }
     if (evaluation.kind == CriterionKind::hard_predicate) {
-      summary.hard_predicates += 1u;
+      if (std::find(hard_criteria.begin(), hard_criteria.end(), evaluation.criterion) ==
+          hard_criteria.end()) {
+        hard_criteria.push_back(evaluation.criterion);
+        summary.hard_predicates += 1u;
+      }
       switch (evaluation.verification) {
         case VerificationState::pass: break;
         case VerificationState::fail: summary.hard_failures += 1u; break;
@@ -532,6 +539,25 @@ Outcome<std::vector<FabricAction>> EnsembleFabric::advance(EnsembleId id,
       if (!execution.planning_complete) {
         execution.planning_complete = true;
         const std::vector<CriterionRef> judge_criteria = judging_criteria(ensemble->spec);
+        // Planning can run again after a fallback stage or for a candidate that
+        // became eligible late.  An evaluation already planned for the same
+        // candidate generation, evaluator and criterion is never planned twice:
+        // the evaluator's second answer would be refused as a duplicate and the
+        // execution could never settle.
+        const auto already_planned = [&execution](const CandidateRecord& candidate,
+                                                  ParticipantId evaluator,
+                                                  const CriterionRef& criterion,
+                                                  CriterionKind kind) {
+          for (const PendingEvaluation& pending : execution.pending) {
+            if (pending.candidate == candidate.id &&
+                pending.candidate_generation == candidate.generation &&
+                pending.evaluator == evaluator && pending.criterion == criterion &&
+                pending.kind == kind && !pending.abandoned) {
+              return true;
+            }
+          }
+          return false;
+        };
         for (const CandidateRecord& candidate : execution.candidates) {
           if (!is_content_state(candidate.state)) {
             continue;
@@ -539,6 +565,10 @@ Outcome<std::vector<FabricAction>> EnsembleFabric::advance(EnsembleId id,
           for (const ParticipantSpec* evaluator : evaluating_participants(ensemble->spec)) {
             if (evaluator->roles.contains(ParticipantRole::verifier)) {
               for (const CriterionRef& criterion : ensemble->spec.evidence.mandatory_criteria) {
+                if (already_planned(candidate, evaluator->id, criterion,
+                                    CriterionKind::hard_predicate)) {
+                  continue;
+                }
                 const auto allocated = impl_->evaluation_ids.allocate();
                 if (!allocated.has_value()) {
                   return fail<std::vector<FabricAction>>(
@@ -562,6 +592,10 @@ Outcome<std::vector<FabricAction>> EnsembleFabric::advance(EnsembleId id,
             }
             if (evaluator->roles.contains(ParticipantRole::judge)) {
               for (const CriterionRef& criterion : judge_criteria) {
+                if (already_planned(candidate, evaluator->id, criterion,
+                                    CriterionKind::ranking_signal)) {
+                  continue;
+                }
                 const auto allocated = impl_->evaluation_ids.allocate();
                 if (!allocated.has_value()) {
                   return fail<std::vector<FabricAction>>(

@@ -72,6 +72,7 @@ struct CandidateEvaluationSummary {
   std::uint32_t abstentions{0};
   std::uint32_t unknowns{0};
   std::uint32_t distinct_evaluators{0};
+  /// Distinct mandatory criteria with hard-predicate evidence.
   std::uint32_t hard_predicates{0};
   std::uint32_t hard_failures{0};
   std::uint32_t hard_unknowns{0};

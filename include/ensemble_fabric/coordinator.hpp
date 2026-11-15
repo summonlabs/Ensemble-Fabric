@@ -74,7 +74,16 @@ class EnsembleCoordinator {
 
   void handle_frame(std::shared_ptr<Connection> connection, const Frame& frame);
   void handle_connection_loss(const std::shared_ptr<Connection>& connection);
-  [[nodiscard]] std::shared_ptr<Connection> find_connection_for(ParticipantId participant) const;
+  [[nodiscard]] std::shared_ptr<Connection> find_connection_for(
+      EnsembleId ensemble, ParticipantId participant, ParticipantGeneration generation) const;
+  void report_unreachable(EnsembleId ensemble, ParticipantId participant,
+                          ParticipantGeneration generation);
+  [[nodiscard]] Status persist_now();
+  /// Replaces the incarnation a submission names with the one of the
+  /// connection it arrived on; false when that connection does not hold the
+  /// participant's registration.
+  [[nodiscard]] bool bind_to_connection(const std::shared_ptr<Connection>& connection,
+                                        ParticipantAuthority& authority) const;
   void pump(EnsembleId ensemble);
   void pump_all();
   void send_frame(const std::shared_ptr<Connection>& connection, const Frame& frame);

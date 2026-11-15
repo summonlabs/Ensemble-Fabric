@@ -1,8 +1,10 @@
 #include "ensemble_fabric/coordinator.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <unordered_map>
 #include <utility>
 
@@ -23,10 +25,12 @@ struct EnsembleCoordinator::Connection {
   WorkerBootId worker_boot;
   std::string label;
   bool handshaken{false};
-  /// Logical participants this connection registered, with the generation it
-  /// holds.  A replacement process registers anew and appears here with a
-  /// higher generation.
-  std::unordered_map<std::uint64_t, ParticipantGeneration> registrations;
+  /// Logical participants this connection registered, keyed by (ensemble,
+  /// participant), with the generation it holds.  Participant identities are
+  /// scoped to their ensemble, so the ensemble is part of the key.  A
+  /// replacement process registers anew and appears here with a higher
+  /// generation.
+  std::map<std::pair<std::uint64_t, std::uint64_t>, ParticipantGeneration> registrations;
   bool closed{false};
 };
 
@@ -41,12 +45,22 @@ struct PendingFinalize {
   EnsembleGeneration generation;
 };
 
+/// One reader thread and the flag it sets when it is about to return.
+struct ReaderThread {
+  std::thread thread;
+  std::shared_ptr<std::atomic<bool>> done;
+};
+
 }  // namespace
 
 struct EnsembleCoordinator::Impl {
   std::mutex pending_mutex;
   std::vector<PendingFinalize> pending_finalizes;
   bool state_dirty{false};
+  /// Reader threads: each one uses this coordinator until it returns.
+  /// Finished ones are joined as new connections arrive, the rest by stop().
+  /// Guarded by the coordinator mutex.
+  std::vector<ReaderThread> readers;
 };
 
 EnsembleCoordinator::EnsembleCoordinator(CoordinatorConfig config)
@@ -70,6 +84,13 @@ Status EnsembleCoordinator::start() {
       if (!recovered.ok()) {
         return fail(recovered.code(), recovered.error().message);
       }
+    }
+    // The epoch this incarnation serves under is made durable before any peer
+    // can observe it: an incarnation that dies before its first state change
+    // must not let the next start reuse the same epoch.
+    const Status saved = persist_now();
+    if (!saved.ok()) {
+      return saved;
     }
   }
   network_ = std::make_unique<NetworkRuntime>();
@@ -138,6 +159,18 @@ Status EnsembleCoordinator::stop() {
   if (accept_thread_.joinable()) {
     accept_thread_.join();
   }
+  // Reader threads use this coordinator until they return; every channel is
+  // closed above, so each one leaves its receive and is joined here.
+  std::vector<ReaderThread> readers;
+  {
+    const std::lock_guard<std::mutex> guard(mutex_);
+    readers.swap(impl_->readers);
+  }
+  for (ReaderThread& reader : readers) {
+    if (reader.thread.joinable()) {
+      reader.thread.join();
+    }
+  }
   if (event_thread_.joinable()) {
     event_thread_.join();
   }
@@ -165,7 +198,32 @@ void EnsembleCoordinator::accept_loop() {
     }
     auto connection = std::make_shared<Connection>();
     {
+      // Readers of connections that ended are joined, so finished threads do
+      // not accumulate over the coordinator's lifetime.
+      std::vector<ReaderThread> finished;
+      {
+        const std::lock_guard<std::mutex> guard(mutex_);
+        for (auto reader = impl_->readers.begin(); reader != impl_->readers.end();) {
+          if (reader->done->load()) {
+            finished.push_back(std::move(*reader));
+            reader = impl_->readers.erase(reader);
+          } else {
+            ++reader;
+          }
+        }
+      }
+      for (ReaderThread& reader : finished) {
+        reader.thread.join();
+      }
+    }
+    {
       const std::lock_guard<std::mutex> guard(mutex_);
+      if (!running_) {
+        // stop() already closed every known connection; one accepted after
+        // that would never be closed and its reader never joined.
+        accepted.value().close();
+        return;
+      }
       if (connections_.size() >= config_.max_connections) {
         accepted.value().close();
         continue;
@@ -173,8 +231,15 @@ void EnsembleCoordinator::accept_loop() {
       connection->id = next_connection_id_++;
       connection->channel = std::make_shared<FrameChannel>(std::move(accepted).value(), config_.limits);
       connections_.emplace(connection->id, connection);
+      auto done = std::make_shared<std::atomic<bool>>(false);
+      ReaderThread reader;
+      reader.done = done;
+      reader.thread = std::thread([this, connection, done]() {
+        reader_loop(connection);
+        done->store(true);
+      });
+      impl_->readers.push_back(std::move(reader));
     }
-    std::thread([this, connection]() { reader_loop(connection); }).detach();
   }
 }
 
@@ -218,15 +283,10 @@ void EnsembleCoordinator::event_loop() {
     }
     for (Event& event : events) {
       if (event.connection_closed) {
-        std::vector<ParticipantId> participants;
         {
           const std::lock_guard<std::mutex> guard(mutex_);
-          for (const auto& entry : event.connection->registrations) {
-            participants.push_back(ParticipantId(entry.first));
-          }
           connections_.erase(event.connection->id);
         }
-        (void)participants;
         // A dead worker process loses its authority immediately.  The
         // coordinator, not the worker, decides what happens next.
         handle_connection_loss(event.connection);
@@ -243,35 +303,39 @@ void EnsembleCoordinator::handle_connection_loss(const std::shared_ptr<Connectio
   const Limits& limits = config_.limits;
   (void)limits;
   // Every logical participant bound to this process incarnation is reported
-  // unavailable; the retry and fallback policies decide what happens next.
-  std::vector<ParticipantAuthority> authorities;
-  for (const auto& entry : connection->registrations) {
-    ParticipantAuthority authority;
-    authority.participant = ParticipantId(entry.first);
-    authority.participant_generation = entry.second;
-    authority.worker = connection->worker;
-    authority.worker_boot = connection->worker_boot;
-    authority.coordinator_epoch = fabric_->epoch();
-    authorities.push_back(authority);
-  }
-  if (authorities.empty()) {
-    return;
+  // unavailable, in the ensemble it was registered for; the retry and fallback
+  // policies decide what happens next.
+  std::vector<std::pair<EnsembleId, ParticipantAuthority>> authorities;
+  {
+    const std::lock_guard<std::mutex> guard(mutex_);
+    for (const auto& entry : connection->registrations) {
+      ParticipantAuthority authority;
+      authority.ensemble = EnsembleId(entry.first.first);
+      authority.participant = ParticipantId(entry.first.second);
+      authority.participant_generation = entry.second;
+      authority.worker = connection->worker;
+      authority.worker_boot = connection->worker_boot;
+      authorities.emplace_back(authority.ensemble, authority);
+    }
+    // The registrations are released: nothing is routed to this connection
+    // any more.
+    connection->registrations.clear();
   }
   std::vector<EnsembleId> ensembles;
-  for (const EnsembleSummary& summary : fabric_->list_ensembles()) {
-    ensembles.push_back(summary.id);
-  }
-  for (EnsembleId id : ensembles) {
-    Outcome<EnsembleSpec> spec = fabric_->spec(id);
+  for (auto& [ensemble, authority] : authorities) {
+    Outcome<EnsembleSpec> spec = fabric_->spec(ensemble);
     if (!spec.ok()) {
       continue;
     }
-    for (ParticipantAuthority& authority : authorities) {
-      authority.ensemble = id;
-      authority.ensemble_generation = spec.value().generation;
-      (void)fabric_->report_participant_failure(authority, ParticipantFailureKind::unavailable,
-                                                "worker process connection closed");
+    authority.ensemble_generation = spec.value().generation;
+    authority.coordinator_epoch = fabric_->epoch();
+    (void)fabric_->report_participant_failure(authority, ParticipantFailureKind::unavailable,
+                                              "worker process connection closed");
+    if (std::find(ensembles.begin(), ensembles.end(), ensemble) == ensembles.end()) {
+      ensembles.push_back(ensemble);
     }
+  }
+  for (const EnsembleId id : ensembles) {
     pump(id);
   }
 }
@@ -303,14 +367,67 @@ void EnsembleCoordinator::send_error(const std::shared_ptr<Connection>& connecti
 }
 
 std::shared_ptr<EnsembleCoordinator::Connection> EnsembleCoordinator::find_connection_for(
-    ParticipantId participant) const {
+    EnsembleId ensemble, ParticipantId participant, ParticipantGeneration generation) const {
+  // Routing is exact: the connection holding this ensemble's participant at the
+  // generation the action was produced for.  Participant identities repeat
+  // across ensembles, and a replaced incarnation's connection may still be open.
   const std::lock_guard<std::mutex> guard(mutex_);
+  const std::pair<std::uint64_t, std::uint64_t> key{ensemble.value(), participant.value()};
   for (const auto& entry : connections_) {
-    if (entry.second->registrations.count(participant.value()) != 0u) {
+    const auto found = entry.second->registrations.find(key);
+    if (found != entry.second->registrations.end() && found->second == generation) {
       return entry.second;
     }
   }
   return nullptr;
+}
+
+void EnsembleCoordinator::report_unreachable(EnsembleId ensemble, ParticipantId participant,
+                                             ParticipantGeneration generation) {
+  // The failure is reported with the incarnation the runtime holds, so the
+  // runtime accepts it and the retry and fallback policies take over.
+  Outcome<EnsembleSnapshot> snapshot = fabric_->inspect(ensemble);
+  if (!snapshot.ok()) {
+    return;
+  }
+  for (const ParticipantSnapshot& view : snapshot.value().participants) {
+    if (view.id != participant || view.generation != generation) {
+      continue;
+    }
+    ParticipantAuthority authority;
+    authority.ensemble = ensemble;
+    authority.ensemble_generation = snapshot.value().generation;
+    authority.participant = participant;
+    authority.participant_generation = generation;
+    authority.worker = view.worker;
+    authority.worker_boot = view.worker_boot;
+    authority.coordinator_epoch = fabric_->epoch();
+    (void)fabric_->report_participant_failure(authority, ParticipantFailureKind::unavailable,
+                                              "no authoritative connection for dispatch");
+    return;
+  }
+}
+
+bool EnsembleCoordinator::bind_to_connection(const std::shared_ptr<Connection>& connection,
+                                             ParticipantAuthority& authority) const {
+  // The physical incarnation is the connection's, never the message's: a
+  // message naming another worker or boot cannot borrow that authority.
+  const std::lock_guard<std::mutex> guard(mutex_);
+  if (!connection->handshaken ||
+      connection->registrations.count({authority.ensemble.value(), authority.participant.value()}) ==
+          0u) {
+    return false;
+  }
+  authority.worker = connection->worker;
+  authority.worker_boot = connection->worker_boot;
+  return true;
+}
+
+Status EnsembleCoordinator::persist_now() {
+  if (!config_.persist_on_change || config_.state_path.empty()) {
+    return ok_status();
+  }
+  return fabric_->save_state(config_.state_path);
 }
 
 void EnsembleCoordinator::pump(EnsembleId ensemble) {
@@ -327,17 +444,11 @@ void EnsembleCoordinator::pump(EnsembleId ensemble) {
     }
     for (const FabricAction& action : actions.value()) {
       if (const auto* dispatch = std::get_if<DispatchAction>(&action)) {
-        std::shared_ptr<Connection> connection = find_connection_for(dispatch->participant);
+        std::shared_ptr<Connection> connection = find_connection_for(
+            dispatch->execution.ensemble, dispatch->participant, dispatch->participant_generation);
         if (connection == nullptr) {
-          ParticipantAuthority authority;
-          authority.ensemble = dispatch->execution.ensemble;
-          authority.ensemble_generation = dispatch->execution.ensemble_generation;
-          authority.participant = dispatch->participant;
-          authority.participant_generation = dispatch->participant_generation;
-          authority.coordinator_epoch = fabric_->epoch();
-          (void)fabric_->report_participant_failure(authority,
-                                                    ParticipantFailureKind::unavailable,
-                                                    "no authoritative connection for dispatch");
+          report_unreachable(dispatch->execution.ensemble, dispatch->participant,
+                             dispatch->participant_generation);
           continue;
         }
         DispatchCandidateMessage message;
@@ -368,7 +479,8 @@ void EnsembleCoordinator::pump(EnsembleId ensemble) {
         frame.payload = payload.take();
         send_frame(connection, frame);
       } else if (const auto* evaluation = std::get_if<EvaluationAction>(&action)) {
-        std::shared_ptr<Connection> connection = find_connection_for(evaluation->judge);
+        std::shared_ptr<Connection> connection = find_connection_for(
+            evaluation->execution.ensemble, evaluation->judge, evaluation->judge_generation);
         if (connection == nullptr) {
           continue;
         }
@@ -399,7 +511,8 @@ void EnsembleCoordinator::pump(EnsembleId ensemble) {
         frame.payload = payload.take();
         send_frame(connection, frame);
       } else if (const auto* cancel = std::get_if<CancelAction>(&action)) {
-        std::shared_ptr<Connection> connection = find_connection_for(cancel->participant);
+        std::shared_ptr<Connection> connection = find_connection_for(
+            cancel->execution.ensemble, cancel->participant, cancel->participant_generation);
         if (connection == nullptr) {
           continue;
         }
@@ -470,10 +583,22 @@ void EnsembleCoordinator::flush_pending_finalize() {
       continue;
     }
     Outcome<EnsembleResult> committed = fabric_->finalize(waiter.ensemble, waiter.generation);
+    // A committed decision is made durable before it is acknowledged: a crash
+    // after the reply must not lose a result the controller was told about.
+    Status durable = ok_status();
+    if (fabric_->current_result(waiter.ensemble).ok()) {
+      durable = persist_now();
+    }
     FinalizeResponseMessage response;
     response.ensemble = waiter.ensemble;
     response.ensemble_generation = waiter.generation;
-    if (committed.ok()) {
+    if (!durable.ok()) {
+      response.accepted = false;
+      response.code = durable.code();
+      response.detail = detail::sanitize_text(
+          "the decision is committed but could not be made durable: " + durable.error().message,
+          config_.limits.max_metadata_bytes);
+    } else if (committed.ok()) {
       response.accepted = true;
       response.code = EnsembleError::ok;
       response.decision = committed.value().decision;
@@ -575,7 +700,15 @@ void EnsembleCoordinator::handle_frame(std::shared_ptr<Connection> connection,
         ack.participant_generation = registered.value();
         ack.detail = "registration accepted";
         const std::lock_guard<std::mutex> guard(mutex_);
-        connection->registrations[record.participant.value()] = registered.value();
+        const std::pair<std::uint64_t, std::uint64_t> key{record.ensemble.value(),
+                                                          record.participant.value()};
+        // The newest incarnation holds the registration alone.
+        for (auto& entry : connections_) {
+          if (entry.second != connection) {
+            entry.second->registrations.erase(key);
+          }
+        }
+        connection->registrations[key] = registered.value();
         {
           const std::lock_guard<std::mutex> pending_guard(impl_->pending_mutex);
           impl_->state_dirty = true;
@@ -615,6 +748,11 @@ void EnsembleCoordinator::handle_frame(std::shared_ptr<Connection> connection,
       CandidateSubmission submission;
       submission.authority = message.value().authority;
       submission.payload = message.value().payload;
+      if (!bind_to_connection(connection, submission.authority.participant)) {
+        send_error(connection, frame.correlation, EnsembleError::participant_not_authoritative,
+                   "this connection does not hold the participant's registration");
+        return;
+      }
       const Status submitted = fabric_->submit_candidate(submission);
       if (!submitted.ok()) {
         // A rejected submission is a typed outcome, not a silent no-op; the
@@ -643,6 +781,11 @@ void EnsembleCoordinator::handle_frame(std::shared_ptr<Connection> connection,
       CandidateFailureSubmission submission;
       submission.authority = message.value().authority;
       submission.participant_failure = static_cast<std::uint32_t>(message.value().kind);
+      if (!bind_to_connection(connection, submission.authority.participant)) {
+        send_error(connection, frame.correlation, EnsembleError::participant_not_authoritative,
+                   "this connection does not hold the participant's registration");
+        return;
+      }
       const Status submitted = fabric_->submit_candidate_failure(submission);
       if (!submitted.ok()) {
         send_error(connection, frame.correlation, submitted.code(), submitted.error().message);
@@ -665,6 +808,11 @@ void EnsembleCoordinator::handle_frame(std::shared_ptr<Connection> connection,
       CandidateAbstentionSubmission submission;
       submission.authority = message.value().authority;
       submission.rationale = message.value().rationale;
+      if (!bind_to_connection(connection, submission.authority.participant)) {
+        send_error(connection, frame.correlation, EnsembleError::participant_not_authoritative,
+                   "this connection does not hold the participant's registration");
+        return;
+      }
       const Status submitted = fabric_->submit_candidate_abstention(submission);
       if (!submitted.ok()) {
         send_error(connection, frame.correlation, submitted.code(), submitted.error().message);
@@ -695,6 +843,11 @@ void EnsembleCoordinator::handle_frame(std::shared_ptr<Connection> connection,
       submission.weight = message.value().weight;
       submission.evidence = message.value().evidence;
       submission.rationale = message.value().rationale;
+      if (!bind_to_connection(connection, submission.authority.evaluator)) {
+        send_error(connection, frame.correlation, EnsembleError::participant_not_authoritative,
+                   "this connection does not hold the evaluator's registration");
+        return;
+      }
       Outcome<EvaluationId> submitted = fabric_->submit_evaluation(submission);
       if (!submitted.ok()) {
         send_error(connection, frame.correlation, submitted.code(), submitted.error().message);

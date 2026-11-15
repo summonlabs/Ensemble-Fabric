@@ -360,6 +360,16 @@ void build_explanation(const EnsembleRecord& ensemble, const ExecutionRecord& ex
 
 }  // namespace
 
+namespace {
+
+/// Derives the result the execution's current evidence supports.  The caller
+/// holds the runtime lock exclusively (the reports are recomputed in place).
+[[nodiscard]] Outcome<EnsembleResult> build_result_locked(EnsembleFabric::Impl& impl,
+                                                          EnsembleRecord* ensemble,
+                                                          ExecutionRecord& execution);
+
+}  // namespace
+
 Outcome<EnsembleResult> EnsembleFabric::prepare_result(EnsembleId id,
                                                        EnsembleGeneration generation) {
   std::unique_lock lock(impl_->mutex);
@@ -383,7 +393,13 @@ Outcome<EnsembleResult> EnsembleFabric::prepare_result(EnsembleId id,
     // than re-deriving a decision from post-commit bookkeeping.
     return execution.result;
   }
+  return build_result_locked(*impl_, ensemble, execution);
+}
 
+namespace {
+
+Outcome<EnsembleResult> build_result_locked(EnsembleFabric::Impl& impl, EnsembleRecord* ensemble,
+                                            ExecutionRecord& execution) {
   compute_reports(*ensemble, execution);
 
   EnsembleResult result;
@@ -443,7 +459,7 @@ Outcome<EnsembleResult> EnsembleFabric::prepare_result(EnsembleId id,
     result.participants.push_back(std::move(outcome));
   }
 
-  const std::uint32_t max_entries = impl_->config.limits.max_explanation_entries;
+  const std::uint32_t max_entries = impl.config.limits.max_explanation_entries;
   std::uint32_t kept = 0;
   for (const CandidateRecord& candidate : execution.candidates) {
     if (kept >= max_entries) {
@@ -493,6 +509,8 @@ Outcome<EnsembleResult> EnsembleFabric::prepare_result(EnsembleId id,
   return result;
 }
 
+}  // namespace
+
 Outcome<EnsembleResult> EnsembleFabric::commit_result(const EnsembleResult& candidate) {
   std::unique_lock lock(impl_->mutex);
   EnsembleRecord* ensemble = impl_->find(candidate.ensemble);
@@ -538,13 +556,30 @@ Outcome<EnsembleResult> EnsembleFabric::commit_result(const EnsembleResult& cand
                                 "the execution requires revalidation after coordinator recovery");
   }
 
+  // The gate commits only the result the evidence it holds supports.  A result
+  // prepared before that evidence changed (a participant lost its authority,
+  // for instance) or one carrying content the selected candidate never
+  // produced is refused; the committed copy is always the runtime's own.
+  Outcome<EnsembleResult> authoritative = build_result_locked(*impl_, ensemble, execution);
+  if (!authoritative.ok()) {
+    return authoritative;
+  }
+  if (commit_fingerprint(candidate) != authoritative.value().commit_fingerprint ||
+      candidate.payload != authoritative.value().payload) {
+    impl_->counters.commits_rejected_conflicting += 1u;
+    return fail<EnsembleResult>(
+        EnsembleError::conflicting_result_commit,
+        "the result does not match the decision the current evidence of this execution "
+        "generation supports; prepare it again");
+  }
+
   const auto result_id = impl_->result_ids.allocate();
   if (!result_id.has_value()) {
     return fail<EnsembleResult>(EnsembleError::resource_limit_exceeded,
                                 "result identity space is exhausted");
   }
 
-  EnsembleResult stored = candidate;
+  EnsembleResult stored = std::move(authoritative).value();
   stored.id = *result_id;
   stored.generation = ResultGeneration(1);
   stored.commit_sequence = impl_->next_sequence();
