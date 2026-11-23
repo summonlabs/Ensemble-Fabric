@@ -1,4 +1,5 @@
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
@@ -91,11 +92,17 @@ int main(int argc, char** argv) {
             << " epoch=" << coordinator.epoch().to_string() << std::endl;
 
   // The coordinator runs its own event loop; this thread only waits for a
-  // termination request.  It uses a condition variable rather than polling, so
-  // the process is completely idle while it serves participants.
+  // termination request on a condition variable.
   {
     std::unique_lock<std::mutex> lock(g_stop_mutex);
-    g_stop_condition.wait(lock, []() { return g_stop.load(); });
+    // The request is made from a signal handler or another thread without this
+    // mutex, so its notification can fall between the test of the flag and the
+    // wait and be lost; an untimed wait then never returned. The flag is
+    // tested again on a short timer, so a lost notification costs at most one
+    // tick.
+    while (!g_stop.load()) {
+      (void)g_stop_condition.wait_for(lock, std::chrono::milliseconds(200));
+    }
   }
   const ensemble_fabric::Status stopped = coordinator.stop();
   if (!stopped.ok()) {

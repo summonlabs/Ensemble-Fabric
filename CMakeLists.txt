@@ -59,7 +59,9 @@ if(ENSEMBLE_FABRIC_ENABLE_ASAN)
   if(MSVC)
     # Debug information is emitted so that sanitizer reports are symbolised.
     add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/fsanitize=address;/Zi>")
-    add_link_options(/fsanitize=address /DEBUG)
+    # /fsanitize=address is a compiler option only: the linker does not know it
+    # (LNK4044), and the sanitizer runtime needs a non-incremental link (LNK4300).
+    add_link_options(/INCREMENTAL:NO /DEBUG)
   else()
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fsanitize=address;-fno-omit-frame-pointer>)
     add_link_options(-fsanitize=address)
